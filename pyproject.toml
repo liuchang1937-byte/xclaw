@@ -1,0 +1,70 @@
+[project]
+name = "xclaw"
+version = "0.1.0"
+description = "XClaw - 基于 pi-mono 架构的极简透明 Python Agent 框架"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0.0",           # AI 客户端 - 通用 LLM 接口
+    "httpx>=0.27.0",           # 异步 HTTP 客户端 (IM webhook)
+    "pydantic>=2.0.0",         # 数据验证和配置管理
+    "loguru>=0.7.0",          # 优雅日志
+    "pyyaml>=6.0",            # YAML 配置解析
+    "lark-oapi>=1.3.0",       # 飞书开放平台 SDK (WebSocket 长连接)
+    "websockets>=12.0",       # WebSocket 支持 (QQ Bot，飞书可选)
+    "mcp>=1.24.0,<2",         # MCP 客户端（固定 SDK 1.x API）
+    "jsonschema>=4.23.0,<5",  # MCP 工具的完整 JSON Schema 参数校验
+    "qrcode>=8.2,<9",         # 微信扫码登录的终端二维码
+    "starlette>=0.27",        # QQ 桥接 HTTP 入口
+    "uvicorn>=0.31",         # QQ 桥接 HTTP 服务
+]
+
+[project.scripts]
+xclaw = "xclaw.server.main:main"
+xclaw-eval = "xclaw.evaluation.runner:main"
+xclaw-eval-audit = "xclaw.evaluation.audit:main"
+xclaw-workspace = "xclaw.core.workspace:main"
+xclaw-score = "xclaw.evaluation.score_cli:main"
+xclaw-context-eval = "xclaw.evaluation.context_probe:main"
+
+[project.optional-dependencies]
+office = [
+    "python-docx>=1.2.0,<2",
+    "openpyxl>=3.1.5,<4",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.3.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+exclude = ["**/__pycache__/**", "**/*.pyc"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"skills" = "xclaw/bundled_skills"
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.3.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

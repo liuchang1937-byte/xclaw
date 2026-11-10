@@ -1,0 +1,15 @@
+{
+  "apps": [{
+    "name": "xclaw-agent",
+    "script": ".venv/Scripts/python.exe",
+    "args": "-m xclaw.server.main --config config.yaml",
+    "cwd": "E:/study/project/XClaw",
+    "autorestart": true,
+    "max_restarts": 10,
+    "restart_delay": 3000,
+    "max_memory_restart": "500M",
+    "log_date_format": "YYYY-MM-DD HH:mm:ss",
+    "error_file": "logs/pm2-error.log",
+    "out_file": "logs/pm2-out.log"
+  }]
+}

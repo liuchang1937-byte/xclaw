@@ -1,0 +1,10 @@
+{
+  "title": "项目周报",
+  "blocks": [
+    {"type": "heading", "level": 1, "text": "本周进展"},
+    {"type": "paragraph", "text": "完成上下文预算检查和执行环境回归验证。"},
+    {"type": "table", "headers": ["事项", "状态"], "rows": [["预算检查", "完成"], ["办公文件 Skill", "进行中"]]},
+    {"type": "heading", "level": 1, "text": "下一步"},
+    {"type": "bullet", "text": "根据实际文档完善测试样例。"}
+  ]
+}

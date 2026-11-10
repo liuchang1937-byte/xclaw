@@ -1,0 +1,12 @@
+FROM python:3.11-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash git \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir pytest pytest-asyncio ruff \
+        'python-docx>=1.2.0,<2' 'openpyxl>=3.1.5,<4'
+
+WORKDIR /workspace
+
+# 容器由 DockerSandbox 以 sleep infinity 启动，再通过 docker exec 执行命令。
+CMD ["sleep", "infinity"]

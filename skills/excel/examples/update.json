@@ -1,0 +1,5 @@
+{
+  "set": [{"sheet": "任务", "cell": "C2", "value": 1, "number_format": "0.0%"}],
+  "append": [{"sheet": "任务", "rows": [["003", "发布检查", 0.25]]}],
+  "styles": [{"sheet": "任务", "range": "A1:C1", "bold": true}]
+}

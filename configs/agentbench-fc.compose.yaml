@@ -1,0 +1,34 @@
+# Official AgentBench task code with a Docker Desktop-compatible bridge network.
+name: xclaw-agentbench-fc
+services:
+  controller:
+    image: jingbh/agentrl-controller:latest
+    command: [controller]
+    ports: ["127.0.0.1:5020:5020"]
+  redis:
+    image: redis:7
+  os-worker:
+    image: xclaw-agentbench-os-worker:20261102-compat
+    build:
+      context: ../.xclaw/benchmarks/AgentBench
+      dockerfile: ../../../configs/agentbench-worker.compat.Dockerfile
+    # Equivalent to the upstream shell wrapper, avoiding CRLF shebangs on Windows.
+    entrypoint: [python, -m, agentrl.worker]
+    command:
+      - --config
+      - configs/tasks/os.yaml
+      - --controller
+      - http://controller:5020/api
+      - --self
+      - http://os-worker:5021/api
+      - os-std
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      OS_STD_PARAMETERS_CONCURRENCY: "1"
+      OS_STD_PARAMETERS_ENV_OPTIONS_NETWORK_NAME: xclaw-agentbench-fc
+      OS_STD_PARAMETERS_ENV_OPTIONS_STATE_OPTIONS_CONNECTION_HOST: redis
+    depends_on: [controller, redis]
+networks:
+  default:
+    name: xclaw-agentbench-fc
