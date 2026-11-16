@@ -14,6 +14,24 @@
 
 私聊创建的任务支持提醒、生成文本和检查 GitHub 提交。网页资料、邮件和 Agent 工具任务由管理员通过 YAML 配置。
 
+## 把网页定时任务的结果发到飞书
+
+先在接收结果的飞书私聊发送 `/schedule inbox`，复制机器人给出的 `feishu_chat_id` 配置行。
+在服务器的 `config.yaml` 中新增一个 `scheduler.jobs` 条目，把该行和网址放进去。
+
+```yaml
+    - id: daily-website-check
+      daily_at: "12:00"
+      utc_offset: "+08:00"
+      urls:
+        - https://example.com/data
+      prompt: 提取当前价格、库存和更新时间，附上来源链接。
+      feishu_chat_id: oc_your_chat_id
+```
+
+保存后重启 XClaw。结果及网页读取失败的通知会发到该私聊，每次执行仍会写入任务状态文件。
+需要同时发邮件时，再给任务增加 `email` 和 `scheduler.smtp` 配置。
+
 ## 从 YAML 配置
 
 在现有 `config.yaml` 加入 `scheduler`，保留原有模型配置。下面的任务每天北京时间 09:00 读取配置中的页面，生成简报并发给指定邮箱。把示例网址、SMTP 服务和邮箱换成自己的设置。

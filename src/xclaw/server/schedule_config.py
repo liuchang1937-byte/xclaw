@@ -72,6 +72,7 @@ class ScheduledJob(BaseModel):
     github_repo: GitHubRepo | None = None
     use_agent_tools: bool = False
     email: ScheduledEmail | None = None
+    feishu_chat_id: str | None = Field(default=None, pattern=r"^oc_[A-Za-z0-9_-]+$")
 
     @model_validator(mode="after")
     def check_schedule(self):

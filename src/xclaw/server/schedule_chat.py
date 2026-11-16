@@ -11,6 +11,7 @@ SCHEDULE_HELP = """可以在这条飞书私聊创建定时任务，时间默认�
 例如「每天 18:00 提醒我写日报」或「每天中午 12 点检查 GitHub owner/repo 有没有更新」。
 任务运行后会把结果发回这条私聊。
 查看：/schedule list
+查看本私聊的投递地址：/schedule inbox
 取消：/schedule cancel 任务编号
 创建提醒：/schedule daily 18:00 写日报
 创建间隔提醒：/schedule every 60 写日报
@@ -47,6 +48,11 @@ def _owner(message: IMMessage) -> ChatScheduleOwner:
 
 async def handle_schedule_command(scheduler: Scheduler, message: IMMessage) -> str:
     _, *args = message.content.strip().split(maxsplit=3)
+    if args == ["inbox"]:
+        return (
+            "把下面这一行加到服务器 config.yaml 的对应定时任务：\n"
+            f"feishu_chat_id: {message.chat_id}"
+        )
     if args == ["list"]:
         return scheduler.list_chat_jobs(_owner(message))
     if len(args) == 2 and args[0] == "cancel":

@@ -9,7 +9,9 @@ from unittest.mock import Mock
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
+from xclaw.server.config import Config
 from xclaw.server.schedule_config import ScheduledJob, SchedulerConfig
 from xclaw.server.scheduler import Scheduler
 
@@ -183,3 +185,66 @@ async def test_restart_marks_interrupted_delivery_without_replaying(tmp_path):
     run_agent.assert_not_called()
     record = json.loads(path.read_bytes())["last_run"]
     assert record["status"] == "delivery_unknown" and record["result"] == "已生成"
+
+
+@pytest.mark.parametrize("scenario", ["success", "source_failure", "delivery_failure"])
+async def test_website_job_sends_result_or_failure_to_configured_feishu_chat(
+    tmp_path, monkeypatch, scenario,
+):
+    config = Config.model_validate({
+        "im": {"platform": "feishu", "feishu_app_id": "test", "feishu_app_secret": "test"},
+        "scheduler": {"state_dir": str(tmp_path), "jobs": [{
+            "id": "brief", "prompt": "整理库存", "every_seconds": 3600,
+            "urls": ["https://example.com/data"], "feishu_chat_id": "oc_private",
+        }]},
+    })
+    with pytest.raises(ValidationError, match="需要启用飞书"):
+        Config(im={"platform": "none"}, scheduler=config.scheduler)
+    due = datetime.now(timezone.utc) - timedelta(seconds=30)
+    path = tmp_path / "job-brief.json"
+    path.write_text(json.dumps({
+        "next_run_at": due.isoformat(), "cadence": "every:3600",
+    }), encoding="utf-8")
+
+    def web_response(_request):
+        if scenario == "source_failure":
+            return httpx.Response(503)
+        return httpx.Response(200, json={"stock": 25})
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: client(
+        **kw, transport=httpx.MockTransport(web_response),
+    ))
+    receipts = []
+
+    async def run_agent(job, prompt, scheduled_at):
+        assert job.id == "brief" and scheduled_at == due
+        assert "stock" in prompt and "25" in prompt
+        return "库存 25 件"
+
+    async def send(chat_id, content):
+        run = json.loads(path.read_bytes())["last_run"]
+        assert run["status"] == ("failed" if scenario == "source_failure" else "sending")
+        receipts.append((chat_id, content))
+        return scenario != "delivery_failure"
+
+    scheduler = Scheduler(config.scheduler, run_agent, send)
+    scheduler.start()
+    try:
+        async with asyncio.timeout(4):
+            while True:
+                record = json.loads(path.read_bytes())["last_run"]
+                if record and record["finished_at"]:
+                    break
+                await asyncio.sleep(0.01)
+    finally:
+        await scheduler.stop()
+    (chat_id, content), = receipts
+    assert chat_id == "oc_private"
+    assert record["status"] == ("completed" if scenario == "success" else "failed")
+    if scenario == "source_failure":
+        assert "执行失败" in content and "503" in content
+    else:
+        assert "库存 25 件" in content and record["result"] == "库存 25 件"
+    if scenario == "delivery_failure":
+        assert "飞书未确认" in record["error"]

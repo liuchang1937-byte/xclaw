@@ -128,11 +128,7 @@ class XClawServer:
         self._shutdown_event = asyncio.Event()
         self._stop_lock = asyncio.Lock()
         self._stopped = False
-        self._supports_chat_schedules = (
-            config.im.platform == "feishu" and config.im.feishu_mode == "websocket"
-            and not config.im.feishu_webhook_url
-            and bool(config.im.feishu_app_id and config.im.feishu_app_secret)
-        )
+        self._supports_chat_schedules = config.im.supports_scheduled_feishu
         self.scheduler = Scheduler(
             config.scheduler, self._run_scheduled_agent,
             send_chat=self._send_scheduled_chat if self._supports_chat_schedules else None,

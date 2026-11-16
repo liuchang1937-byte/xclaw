@@ -46,6 +46,9 @@ async def test_chat_reminder_survives_restart_and_delivers_only_to_owner(tmp_pat
         help_text = await server._handle_im_message(message("你可以做定时任务吗"))
         assert "/schedule daily" in help_text
         server._build_agent.assert_not_called()
+        assert "feishu_chat_id: private-chat" in await server._handle_im_message(
+            message("/schedule inbox")
+        )
         result = await server._handle_im_message(message(text))
         assert "已安排定时任务" in result and "18:00（北京时间）" in result
         server._build_agent.assert_called_once_with(schedule_dialog=True)

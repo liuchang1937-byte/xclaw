@@ -253,6 +253,7 @@ class Scheduler:
         self, job: ScheduledJob, path: Path, state: _JobState, run: _Run, chat_job: _ChatJob | None,
     ) -> None:
         logger.info("开始定时任务 {}", job.id)
+        chat_id = chat_job.owner.chat_id if chat_job else job.feishu_chat_id
         try:
             async with asyncio.timeout(job.timeout_seconds):
                 if job.github_repo:
@@ -262,16 +263,10 @@ class Scheduler:
                 else:
                     result = await self._agent_result(job, run.scheduled_at)
                 run.result = result
-            if job.email:
+            if job.email or chat_id:
                 run.status = "sending"
                 atomic_json(path, state.model_dump(mode="json"))
-                await run_blocking(send_scheduled_email, self._config.smtp, job.email, result)
-            elif chat_job and self._send_chat:
-                run.status = "sending"
-                atomic_json(path, state.model_dump(mode="json"))
-                text = f"定时任务 {job.id}\n{result}"
-                if not await self._send_chat(chat_job.owner.chat_id, text):
-                    raise ValueError("飞书未确认消息发送成功")
+                await self._deliver(job, chat_id, result)
             run.status = "completed"
         except asyncio.CancelledError:
             run.status = "delivery_unknown" if run.status == "sending" else "interrupted"
@@ -280,8 +275,15 @@ class Scheduler:
         except DeliveryUncertainError as exc:
             run.status, run.error = "delivery_unknown", str(exc)
         except Exception as exc:
-            stage = "结果发送" if run.status == "sending" else "任务执行"
+            delivery_failed = run.status == "sending"
+            stage = "结果发送" if delivery_failed else "任务执行"
             run.status, run.error = "failed", f"{stage}：{_describe_error(exc)}"
+            if chat_id and not delivery_failed:
+                atomic_json(path, state.model_dump(mode="json"))
+                try:
+                    await self._deliver_feishu(chat_id, f"定时任务 {job.id} 执行失败\n{run.error}")
+                except Exception as delivery_error:
+                    run.error += f"；飞书通知失败：{_describe_error(delivery_error)}"
         finally:
             finished = run.finished_at = _now()
             if state.next_run_at <= finished:
@@ -291,6 +293,26 @@ class Scheduler:
                 logger.warning("定时任务 {} 结束（{}）：{}", job.id, run.status, run.error)
             else:
                 logger.info("定时任务 {} 已完成", job.id)
+
+    async def _deliver(self, job: ScheduledJob, chat_id: str | None, result: str) -> None:
+        deliveries = []
+        if chat_id:
+            deliveries.append(self._deliver_feishu(chat_id, f"定时任务 {job.id}\n{result}"))
+        if job.email:
+            deliveries.append(
+                run_blocking(send_scheduled_email, self._config.smtp, job.email, result)
+            )
+        outcomes = await asyncio.gather(*deliveries, return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, DeliveryUncertainError):
+                raise outcome
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+
+    async def _deliver_feishu(self, chat_id: str, text: str) -> None:
+        if not self._send_chat or not await self._send_chat(chat_id, text):
+            raise ValueError("飞书未确认消息发送成功")
 
     async def _check_github(self, repo: str, timeout: int, state: _JobState) -> str:
         head = await run_blocking(fetch_github_head, repo, min(timeout, 20))

@@ -16,7 +16,7 @@ from typing import Literal
 
 import yaml
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from xclaw.core.execution import ExecutionMode
 from xclaw.core.scheduling import SchedulingConfig
@@ -58,6 +58,14 @@ class IMConfig(BaseModel):
     qq_bridge_send_command: list[str] = Field(default_factory=list)
 
     weixin_state_file: Path = Field(default_factory=lambda: Path.home() / ".xclaw/weixin.json")
+
+    @property
+    def supports_scheduled_feishu(self) -> bool:
+        return (
+            self.platform == "feishu" and self.feishu_mode == "websocket"
+            and not self.feishu_webhook_url
+            and bool(self.feishu_app_id and self.feishu_app_secret)
+        )
 
 
 class AgentConfig(BaseModel):
@@ -150,6 +158,14 @@ class Config(BaseModel):
 
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+
+    @model_validator(mode="after")
+    def check_scheduled_feishu(self):
+        if not self.im.supports_scheduled_feishu and any(
+            job.enabled and job.feishu_chat_id for job in self.scheduler.jobs
+        ):
+            raise ValueError("定时任务配置 feishu_chat_id 需要启用飞书应用机器人的 WebSocket 模式")
+        return self
 
     @classmethod
     def from_yaml(cls, path: str) -> Config:
