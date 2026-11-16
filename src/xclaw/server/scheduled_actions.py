@@ -1,13 +1,16 @@
 """Read configured sources and deliver completed scheduled task results."""
 
+import asyncio
 import os
 import re
 import smtplib
+import socket
 import ssl
 import subprocess
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from html.parser import HTMLParser
+from ipaddress import IPv6Address, ip_address, ip_network
 
 import httpx
 
@@ -15,6 +18,8 @@ from xclaw.server.schedule_config import ScheduledEmail, ScheduledJob, SMTPConfi
 
 _MAX_SOURCE_BYTES = 2_000_000
 _TOTAL_SOURCE_CHARS = 12_000
+_IPV6_UNICAST = ip_network("2000::/3")
+_IPV6_TRANSITION = (ip_network("2001::/32"), ip_network("2002::/16"))
 
 
 class DeliveryUncertainError(RuntimeError):
@@ -66,14 +71,50 @@ class _PageText(HTMLParser):
             self.parts.append(data.strip())
 
 
-async def fetch_sources(job: ScheduledJob) -> list[dict[str, str | bool]]:
+async def _public_source(url: httpx.URL) -> httpx.URL:
+    """Resolve once and connect to a validated address, even if DNS changes later."""
+    try:
+        info = await asyncio.get_running_loop().getaddrinfo(
+            url.raw_host.decode("ascii"), url.port, type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise ValueError(f"无法解析网页域名 {url.host}") from exc
+    addresses = {ip_address(item[4][0]) for item in info}
+    if not addresses or any(
+        not address.is_global or address.is_multicast or address.is_reserved
+        or (
+            isinstance(address, IPv6Address)
+            and (address not in _IPV6_UNICAST or any(address in net for net in _IPV6_TRANSITION))
+        )
+        for address in addresses
+    ):
+        raise ValueError("私聊定时任务只支持公网网页或数据接口")
+    address = min(addresses, key=lambda item: (item.version, int(item)))
+    return url.copy_with(host=address.compressed)
+
+
+async def fetch_sources(
+    job: ScheduledJob, *, public_only: bool = False,
+) -> list[dict[str, str | bool]]:
     if not job.urls:
         return []
     results = []
     limit = _TOTAL_SOURCE_CHARS // len(job.urls)
-    async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
-        for url in job.urls:
-            async with client.stream("GET", str(url)) as response:
+    options = {"trust_env": False, "limits": httpx.Limits(max_keepalive_connections=0)}
+    async with httpx.AsyncClient(
+        timeout=20, follow_redirects=False, **(options if public_only else {}),
+    ) as client:
+        for source in job.urls:
+            url = httpx.URL(str(source))
+            if public_only:
+                target = await _public_source(url)
+                request_args = {
+                    "headers": {"Host": url.netloc.decode("ascii")},
+                    "extensions": {"sni_hostname": url.raw_host.decode("ascii")},
+                }
+            else:
+                target, request_args = url, {}
+            async with client.stream("GET", target, **request_args) as response:
                 response.raise_for_status()
                 kind = response.headers.get("Content-Type", "").split(";", 1)[0].lower().strip()
                 if not (
@@ -99,7 +140,7 @@ async def fetch_sources(job: ScheduledJob) -> list[dict[str, str | bool]]:
             if not content:
                 raise ValueError("资料网址没有可读取的文字")
             results.append({
-                "url": str(url), "text": content[:limit], "truncated": len(content) > limit,
+                "url": str(source), "text": content[:limit], "truncated": len(content) > limit,
             })
     return results
 

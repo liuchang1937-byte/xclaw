@@ -1,8 +1,12 @@
 import asyncio
 import json
+import socket
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+
+import httpx
+import pytest
 
 from xclaw.core.tool import ToolRegistry
 from xclaw.im.adapter import IMMessage
@@ -87,3 +91,94 @@ async def test_chat_reminder_survives_restart_and_delivers_only_to_owner(tmp_pat
         assert json.loads((tmp_path / "chat-jobs.json").read_bytes()) == {}
     finally:
         await server.scheduler.stop()
+
+
+@pytest.mark.parametrize("case", ["public", "private_dns", "redirect"])
+async def test_website_task_delivers_to_creator_after_restart(tmp_path, monkeypatch, case):
+    server = object.__new__(XClawServer)
+    server._supports_chat_schedules = True
+    server._session_locks = {}
+    send = AsyncMock(return_value=True)
+    server.im_adapter = SimpleNamespace(send_message=send)
+    settings = SchedulerConfig(state_dir=str(tmp_path))
+    source = "https://website.example/data?item=123"
+
+    async def summarize(_job, prompt, _scheduled_at):
+        (page,) = json.loads(prompt.splitlines()[-1])
+        assert page["url"] == source and json.loads(page["text"]) == {"stock": 9}
+        return "库存还有 9 件"
+
+    def start():
+        server.scheduler = Scheduler(settings, summarize, server._send_scheduled_chat)
+        server.scheduler.start()
+
+    registry = ToolRegistry()
+
+    async def create(_):
+        options = {"daily_at": "12:00", "prompt": "提取库存"}
+        bad = await registry.execute("schedule_website", json.dumps({
+            **options, "urls": ["https://invented.example/data"],
+        }))
+        assert "必须由用户在本条消息中提供" in bad
+        return await registry.execute("schedule_website", json.dumps({
+            **options, "urls": [source],
+        }))
+
+    server._build_agent = Mock(return_value=SimpleNamespace(
+        run=create, tool_registry=registry, sandbox_router=SimpleNamespace(stop=AsyncMock()),
+    ))
+    start()
+    try:
+        result = await server._handle_im_message(message(f"每天12点读取 {source}，提取库存"))
+        assert "已安排定时任务" in result and source in result
+        catalog = json.loads((tmp_path / "chat-jobs.json").read_bytes())
+        job_id, = catalog
+        assert catalog[job_id]["job"]["urls"] == [source]
+    finally:
+        await server.scheduler.stop()
+
+    replies = [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 0))]
+    if case == "private_dns":
+        replies.append((socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.2", 0)))
+    dns = AsyncMock(return_value=replies)
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", dns)
+    requests = []
+
+    def request_handler(request):
+        requests.append(request)
+        assert request.url.host == "93.184.216.34"
+        assert request.headers["host"] == "website.example"
+        assert request.extensions["sni_hostname"] == "website.example"
+        assert request.url.raw_path == b"/data?item=123"
+        if case == "redirect":
+            return httpx.Response(302, headers={"Location": "http://127.0.0.1/private"})
+        return httpx.Response(200, json={"stock": 9})
+
+    default_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: default_client(
+        **kw, transport=httpx.MockTransport(request_handler),
+    ))
+    path = tmp_path / "chat" / f"job-{job_id}.json"
+    state = json.loads(path.read_bytes())
+    state["next_run_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    path.write_text(json.dumps(state), encoding="utf-8")
+    start()
+    try:
+        async with asyncio.timeout(4):
+            while True:
+                run = json.loads(path.read_bytes())["last_run"]
+                if run and run["finished_at"]:
+                    break
+                await asyncio.sleep(0.01)
+    finally:
+        await server.scheduler.stop()
+
+    dns.assert_awaited_once()
+    assert len(requests) == (0 if case == "private_dns" else 1)
+    send.assert_awaited_once()
+    assert send.await_args.args[0] == "private-chat"
+    assert send.await_args.kwargs == {"chat_type": "p2p"}
+    expected_result = {
+        "public": "库存还有 9 件", "private_dns": "只支持公网", "redirect": "HTTP 302",
+    }[case]
+    assert expected_result in send.await_args.args[1]

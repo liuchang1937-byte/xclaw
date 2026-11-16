@@ -152,6 +152,7 @@ class Scheduler:
     def create_chat_job(
         self, owner: ChatScheduleOwner, message_id: str, *, daily_at: str = "",
         every_minutes: int = 0, prompt: str = "", github_repo: str = "", reminder: bool = False,
+        urls: list[str] | None = None,
     ) -> str:
         self._require_chat()
         digest = hashlib.sha256(
@@ -164,9 +165,12 @@ class Scheduler:
             raise ValueError("任务编号冲突，请重新发送请求")
         if len(prompt) > 1000 or reminder and not prompt.strip():
             raise ValueError("任务内容须在 1000 字以内，提醒需填写正文")
+        if reminder and urls:
+            raise ValueError("网页任务需要填写提取要求")
         job = ScheduledJob(
             id=job_id, daily_at=daily_at or None, every_seconds=every_minutes * 60 or None,
             utc_offset="+08:00", prompt=prompt or None, github_repo=github_repo or None,
+            urls=urls or [],
         )
         entry = _ChatJob(owner=owner, job=job, reminder=reminder)
         path = self._chat_state_path(job_id)
@@ -207,6 +211,8 @@ class Scheduler:
         content = job.github_repo or job.prompt
         last = state.last_run
         summary = f"{job.id} · {interval}（北京时间）\n{content}\n下次 {next_local:%m-%d %H:%M}"
+        if job.urls:
+            summary += "\n网址：" + "、".join(str(url) for url in job.urls)
         if last and last.error:
             summary += f"\n最近一次异常：{last.error}"
         return summary
@@ -261,7 +267,9 @@ class Scheduler:
                 elif chat_job and chat_job.reminder:
                     result = job.prompt
                 else:
-                    result = await self._agent_result(job, run.scheduled_at)
+                    result = await self._agent_result(
+                        job, run.scheduled_at, public_only=chat_job is not None,
+                    )
                 run.result = result
             if job.email or chat_id:
                 run.status = "sending"
@@ -324,8 +332,10 @@ class Scheduler:
             return f"{repo} 默认分支已记录首次检查的提交。\n当前提交：{head}"
         return f"{repo} 默认分支有更新。\n上次提交：{previous}\n当前提交：{head}"
 
-    async def _agent_result(self, job: ScheduledJob, scheduled_at: datetime) -> str:
-        sources = await fetch_sources(job)
+    async def _agent_result(
+        self, job: ScheduledJob, scheduled_at: datetime, *, public_only: bool,
+    ) -> str:
+        sources = await fetch_sources(job, public_only=public_only)
         prompt = job.prompt or ""
         if sources:
             prompt += (
