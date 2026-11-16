@@ -35,7 +35,7 @@ from xclaw.core.execution import Capability
 from xclaw.core.scheduling import tool_failed
 from xclaw.core.workspace import TaskWorkspace
 from xclaw.im import FeishuAdapter, IMAdapter, QQAdapter, QQBridgeAdapter, WeixinAdapter
-from xclaw.im.adapter import IMReply
+from xclaw.im.adapter import IMMessage, IMReply
 from xclaw.im.delivery import (
     collect_deliveries,
     register_delivery_tool,
@@ -46,6 +46,13 @@ from xclaw.im.weixin import login_weixin
 from xclaw.mcp import MCPClientManager
 from xclaw.mom.bus import EventBus
 from xclaw.server.config import Config, load_config
+from xclaw.server.schedule_chat import (
+    SCHEDULE_HELP,
+    SCHEDULE_PROMPT,
+    handle_schedule_command,
+    is_schedule_request,
+    register_schedule_tools,
+)
 from xclaw.server.schedule_config import ScheduledJob
 from xclaw.server.scheduler import Scheduler
 
@@ -121,7 +128,15 @@ class XClawServer:
         self._shutdown_event = asyncio.Event()
         self._stop_lock = asyncio.Lock()
         self._stopped = False
-        self.scheduler = Scheduler(config.scheduler, self._run_scheduled_agent)
+        self._supports_chat_schedules = (
+            config.im.platform == "feishu" and config.im.feishu_mode == "websocket"
+            and not config.im.feishu_webhook_url
+            and bool(config.im.feishu_app_id and config.im.feishu_app_secret)
+        )
+        self.scheduler = Scheduler(
+            config.scheduler, self._run_scheduled_agent,
+            send_chat=self._send_scheduled_chat if self._supports_chat_schedules else None,
+        )
 
         logger.info("XClaw 服务初始化完成")
 
@@ -213,10 +228,13 @@ class XClawServer:
 
     def _build_agent(
         self, workspace_dir: str | None = None, *, scheduled_job: ScheduledJob | None = None,
+        schedule_dialog: bool = False,
     ) -> CodingAgent:
         """创建一个新的 CodingAgent（供默认 Agent 和多会话复用）"""
         agent_config = self.config.agent
-        with_tools = scheduled_job is None or scheduled_job.use_agent_tools
+        with_tools = not schedule_dialog and (
+            scheduled_job is None or scheduled_job.use_agent_tools
+        )
 
         # 获取默认 Provider
         provider_name = self.config.default_provider
@@ -242,8 +260,8 @@ class XClawServer:
             max_tokens=agent_config.max_tokens,
             max_tool_rounds=agent_config.max_tool_rounds,
             tool_scheduling=agent_config.tool_scheduling,
-            system_prompt=agent_config.system_prompt,
-            auto_memory=agent_config.auto_memory and scheduled_job is None,
+            system_prompt=SCHEDULE_PROMPT if schedule_dialog else agent_config.system_prompt,
+            auto_memory=agent_config.auto_memory and scheduled_job is None and not schedule_dialog,
             enable_context_compression=agent_config.enable_context_compression,
             context_window=provider_config.context_window,
             compression_trigger_ratio=agent_config.compression_trigger_ratio,
@@ -251,8 +269,8 @@ class XClawServer:
             compression_keep_recent=agent_config.compression_keep_recent,
             docker_image=agent_config.docker_image,
             workspace_dir=workspace_dir or agent_config.workspace_dir,
-            trace_dir=agent_config.trace_dir,
-            checkpoint_dir=agent_config.checkpoint_dir,
+            trace_dir=None if schedule_dialog else agent_config.trace_dir,
+            checkpoint_dir=None if schedule_dialog else agent_config.checkpoint_dir,
             context_strategy=agent_config.context_strategy,
             skills_dir=agent_config.skills_dir,
             execution_policy=agent_config.build_execution_policy(),
@@ -264,6 +282,31 @@ class XClawServer:
             if scheduled_job is None and self.im_adapter and self.im_adapter.supports_files:
                 register_delivery_tool(agent.tool_registry)
         return agent
+
+    async def _send_scheduled_chat(self, chat_id: str, content: str) -> bool:
+        return await self.im_adapter.send_message(chat_id, content, chat_type="p2p")
+
+    async def _handle_schedule_request(self, message: IMMessage) -> str:
+        if (
+            message.chat_type not in ("private", "p2p")
+            or not (message.chat_id and message.sender_id and message.message_id)
+        ):
+            return "请在飞书私聊中管理定时任务。"
+        try:
+            text = message.content.strip()
+            if text.split(maxsplit=1)[0] == "/schedule":
+                return await handle_schedule_command(self.scheduler, message)
+            if re.fullmatch(r"(?:你)?(?:可以|能|会)(?:做|创建|设置|执行)?定时任务吗[?？]?", text):
+                return SCHEDULE_HELP
+            agent = self._build_agent(schedule_dialog=True)
+            try:
+                results = register_schedule_tools(agent.tool_registry, self.scheduler, message)
+                reply = await agent.run(text)
+                return "\n\n".join(dict.fromkeys(results)) or reply or SCHEDULE_HELP
+            finally:
+                await agent.sandbox_router.stop()
+        except ValueError as exc:
+            return f"定时任务请求未能完成。{exc}"
 
     async def _run_scheduled_agent(
         self, job: ScheduledJob, prompt: str, scheduled_at: datetime,
@@ -390,6 +433,12 @@ class XClawServer:
         # 忽略空消息
         if not message.content.strip():
             return None
+
+        if (
+            getattr(self, "_supports_chat_schedules", False) and message.platform == "feishu"
+            and not getattr(message, "attachments", None) and is_schedule_request(message)
+        ):
+            return await self._handle_schedule_request(message)
 
         # 按会话隔离：拿到当前会话对应的 Agent
         agent = self._get_or_create_agent(message)
