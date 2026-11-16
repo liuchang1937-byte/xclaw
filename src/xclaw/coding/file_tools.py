@@ -177,7 +177,7 @@ def _list_directory(path: str = ".", pattern: str = "*") -> str:
 
     Args:
         path: 目录路径
-        pattern: 文件名过滤模式（如 "*.py"）
+        pattern: 文件名过滤模式（如 "*.py" 或递归匹配的 "**/*.py"）
 
     Returns:
         str: 目录内容列表
@@ -207,7 +207,7 @@ def _list_directory(path: str = ".", pattern: str = "*") -> str:
         if dirs:
             result_lines.append("📂 子目录:")
             for d in dirs:
-                result_lines.append(f"   {d.name}/")
+                result_lines.append(f"   {d.relative_to(dir_path).as_posix()}/")
             result_lines.append("")
 
         if files:
@@ -215,7 +215,7 @@ def _list_directory(path: str = ".", pattern: str = "*") -> str:
             for f in files:
                 size = f.stat().st_size
                 size_str = _format_size(size)
-                result_lines.append(f"   {f.name} ({size_str})")
+                result_lines.append(f"   {f.relative_to(dir_path).as_posix()} ({size_str})")
 
         return "\n".join(result_lines)
 
@@ -441,8 +441,8 @@ def register_file_tools(
         Tool(
             name="list_directory",
             description=(
-                "列出目录中的文件和子目录。支持文件名模式过滤（如 '*.py'）。"
-                "显示文件大小和数量统计。"
+                "列出目录中的文件和子目录。支持按名称匹配（如 '*.py'），"
+                "或用 '**/*.py' 递归查找文件。返回相对于所查目录的路径、文件大小和数量。"
             ),
             func=list_directory,
             parallel_safe=True,

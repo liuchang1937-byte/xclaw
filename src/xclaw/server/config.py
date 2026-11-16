@@ -22,6 +22,7 @@ from xclaw.core.execution import ExecutionMode
 from xclaw.core.scheduling import SchedulingConfig
 from xclaw.mcp.config import MCPServerConfig
 from xclaw.sandbox.policy import ExecutionPolicy
+from xclaw.server.schedule_config import SchedulerConfig
 
 
 class ProviderConfig(BaseModel):
@@ -38,7 +39,7 @@ class ProviderConfig(BaseModel):
 class IMConfig(BaseModel):
     """IM 平台配置"""
 
-    platform: str = "feishu"  # "feishu"、"qq" 或 "weixin"
+    platform: str = "feishu"  # "feishu"、"qq"、"weixin" 或 "none"
 
     # 飞书配置
     feishu_mode: str = "websocket"  # "webhook" | "websocket" | "http"
@@ -148,6 +149,7 @@ class Config(BaseModel):
     log: LogConfig = Field(default_factory=LogConfig)
 
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
 
     @classmethod
     def from_yaml(cls, path: str) -> Config:

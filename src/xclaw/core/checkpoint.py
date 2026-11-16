@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -14,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from xclaw.ai.types import ChatMessage, ToolCall, ToolResult
 from xclaw.core.scheduling import BatchPlan, tool_failed
-from xclaw.persistence import atomic_json
+from xclaw.persistence import atomic_json, exclusive_file_lock
 
 
 class UncertainToolExecutionError(RuntimeError):
@@ -97,36 +95,11 @@ class CheckpointStore:
                 states.append(state)
         return states
 
-    @contextmanager
     def lease(self, run_id: str):
         """OS lock is released on process death; retain the lock file to avoid races."""
-        path = self.path(run_id).with_suffix(".lock")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a+b") as stream:
-            stream.seek(0, os.SEEK_END)
-            if stream.tell() == 0:
-                stream.write(b"0")
-                stream.flush()
-            stream.seek(0)
-            try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                raise RuntimeError("该 checkpoint 正在被另一个执行器使用") from exc
-            try:
-                yield
-            finally:
-                stream.seek(0)
-                if os.name == "nt":
-                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        return exclusive_file_lock(
+            self.path(run_id).with_suffix(".lock"), "该 checkpoint 正在被另一个执行器使用"
+        )
 
 
 class ToolJournal:

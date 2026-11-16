@@ -17,6 +17,9 @@ docker build -f Dockerfile.sandbox -t xclaw-sandbox:latest .
 QQ 可选 WebSocket 直连或 HTTP 桥接，个人微信通过 iLink ClawBot 扫码绑定。
 配置和启动方式见 [QQ 与微信接入](docs/QQ_WEIXIN.md)。
 
+正常服务模式支持按间隔或每天定时运行任务，可以读取指定网址、生成报告并通过 SMTP 发邮件。
+配置和运行记录见 [定时任务](docs/SCHEDULED_TASKS.md)。
+
 执行权限可配置为 `view / edit / execute`，后端为 Host / Docker。
 默认 `execute`，独立文件删除工具默认关闭；Docker 仍共享指定工作区。
 完整配置、边界和验证方法见 [执行环境说明](docs/EXECUTION_ENVIRONMENTS.md)。

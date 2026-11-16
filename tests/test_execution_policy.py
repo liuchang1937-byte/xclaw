@@ -95,6 +95,21 @@ async def test_recursive_search_applies_denied_paths(tmp_path):
     assert "needle_secret" not in result
 
 
+async def test_recursive_listing_distinguishes_matching_files_and_applies_denied_paths(tmp_path):
+    for directory in ("api", "worker", "private"):
+        (tmp_path / directory).mkdir()
+        (tmp_path / directory / "handler.py").write_text("pass\n", encoding="utf-8")
+    (tmp_path / "api" / "README.md").write_text("notes\n", encoding="utf-8")
+    registry, _ = build_registry(tmp_path, ExecutionPolicy(denied_paths=("private/**",)))
+
+    result = await registry.execute("list_directory", '{"path":".","pattern":"**/*.py"}')
+
+    assert "api/handler.py" in result
+    assert "worker/handler.py" in result
+    assert "private/handler.py" not in result
+    assert "README.md" not in result
+
+
 async def test_custom_write_scope_and_git_metadata_protection(tmp_path):
     (tmp_path / "src").mkdir()
     registry, _ = build_registry(tmp_path, ExecutionPolicy(write_paths=("src/**",)))

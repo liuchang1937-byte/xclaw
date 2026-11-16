@@ -14,6 +14,7 @@ from xclaw.server.main import XClawServer, run_demo
 def make_server(*agents):
     server = object.__new__(XClawServer)
     server.im_adapter = None
+    server.scheduler = SimpleNamespace(start=Mock(), stop=AsyncMock())
     server.mcp = SimpleNamespace(start=AsyncMock(), stop=AsyncMock(), attach_tools=Mock())
     server.agent = agents[0] if agents else None
     server._sessions = {str(index): agent for index, agent in enumerate(agents)}
@@ -42,6 +43,8 @@ async def test_service_stop_wakes_start_and_deduplicates_agents(monkeypatch):
     await asyncio.wait_for(task, timeout=1)
     await server.stop()
     assert server._shutdown_event.is_set()
+    server.scheduler.start.assert_called_once()
+    server.scheduler.stop.assert_awaited_once()
     agent.sandbox_router.stop.assert_awaited_once()
     agent.stop.assert_called_once()
 

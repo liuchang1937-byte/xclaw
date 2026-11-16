@@ -23,12 +23,14 @@ import json
 import re
 import signal
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from loguru import logger
 
 from xclaw.ai.provider import OpenAIProvider, ProviderRegistry
 from xclaw.coding import CodingAgent
+from xclaw.core.concurrency import run_blocking
 from xclaw.core.execution import Capability
 from xclaw.core.scheduling import tool_failed
 from xclaw.core.workspace import TaskWorkspace
@@ -44,6 +46,8 @@ from xclaw.im.weixin import login_weixin
 from xclaw.mcp import MCPClientManager
 from xclaw.mom.bus import EventBus
 from xclaw.server.config import Config, load_config
+from xclaw.server.schedule_config import ScheduledJob
+from xclaw.server.scheduler import Scheduler
 
 
 def _restore_checkpoint_deliveries(snapshot, agent, files):
@@ -117,6 +121,7 @@ class XClawServer:
         self._shutdown_event = asyncio.Event()
         self._stop_lock = asyncio.Lock()
         self._stopped = False
+        self.scheduler = Scheduler(config.scheduler, self._run_scheduled_agent)
 
         logger.info("XClaw 服务初始化完成")
 
@@ -199,16 +204,19 @@ class XClawServer:
         elif im_config.platform == "weixin":
             self.im_adapter = WeixinAdapter(im_config.weixin_state_file)
 
-        else:
+        elif im_config.platform != "none":
             logger.warning(f"未知的 IM 平台: {im_config.platform}")
 
         # 注册消息处理器
         if self.im_adapter:
             self.im_adapter.on_message(self._handle_im_message)
 
-    def _build_agent(self, workspace_dir: str | None = None) -> CodingAgent:
+    def _build_agent(
+        self, workspace_dir: str | None = None, *, scheduled_job: ScheduledJob | None = None,
+    ) -> CodingAgent:
         """创建一个新的 CodingAgent（供默认 Agent 和多会话复用）"""
         agent_config = self.config.agent
+        with_tools = scheduled_job is None or scheduled_job.use_agent_tools
 
         # 获取默认 Provider
         provider_name = self.config.default_provider
@@ -235,7 +243,7 @@ class XClawServer:
             max_tool_rounds=agent_config.max_tool_rounds,
             tool_scheduling=agent_config.tool_scheduling,
             system_prompt=agent_config.system_prompt,
-            auto_memory=agent_config.auto_memory,
+            auto_memory=agent_config.auto_memory and scheduled_job is None,
             enable_context_compression=agent_config.enable_context_compression,
             context_window=provider_config.context_window,
             compression_trigger_ratio=agent_config.compression_trigger_ratio,
@@ -248,13 +256,45 @@ class XClawServer:
             context_strategy=agent_config.context_strategy,
             skills_dir=agent_config.skills_dir,
             execution_policy=agent_config.build_execution_policy(),
-            register_default_tools=True,
+            register_default_tools=with_tools,
             event_bus=self.event_bus,
         )
-        self.mcp.attach_tools(agent.tool_registry)
-        if self.im_adapter and self.im_adapter.supports_files:
-            register_delivery_tool(agent.tool_registry)
+        if with_tools:
+            self.mcp.attach_tools(agent.tool_registry)
+            if scheduled_job is None and self.im_adapter and self.im_adapter.supports_files:
+                register_delivery_tool(agent.tool_registry)
         return agent
+
+    async def _run_scheduled_agent(
+        self, job: ScheduledJob, prompt: str, scheduled_at: datetime,
+    ) -> str:
+        config = self.config.agent
+        task_workspace = None
+        if job.use_agent_tools and config.isolate_workspace:
+            task_workspace = await run_blocking(
+                TaskWorkspace.create, config.workspace_dir, config.task_workspace_dir,
+                excluded=tuple(config.denied_paths),
+            )
+        agent = self._build_agent(
+            str(task_workspace.work) if task_workspace else None, scheduled_job=job,
+        )
+        agent.run_metadata = {
+            "session_id": f"schedule:{job.id}",
+            "source_workspace": str(Path(config.workspace_dir).resolve()),
+            "scheduled_at": scheduled_at.isoformat(),
+        }
+        if task_workspace:
+            agent.run_metadata["task_directory"] = str(task_workspace.directory)
+        try:
+            result = await agent.run(prompt)
+            if agent.last_run_status != "completed":
+                raise ValueError(f"Agent 未完成（{agent.last_run_status}）")
+            if task_workspace:
+                patch = await run_blocking(task_workspace.export_diff)
+                result += f"\n\n任务副本：{task_workspace.directory}\n变更记录：{patch}"
+            return result
+        finally:
+            await agent.sandbox_router.stop()
 
     def _setup_agent(self) -> None:
         """初始化默认 Agent（demo 模式 / 单实例场景使用）"""
@@ -547,6 +587,7 @@ class XClawServer:
             except Exception:
                 pass
 
+        self.scheduler.start()
         logger.info("XClaw 服务已启动，等待消息...")
 
         # 保持服务运行
@@ -563,6 +604,10 @@ class XClawServer:
                 return
             logger.info("正在停止 XClaw 服务...")
             errors = []
+            try:
+                await self.scheduler.stop()
+            except Exception as exc:
+                errors.append(exc)
             if self.im_adapter:
                 try:
                     await self.im_adapter.stop()
