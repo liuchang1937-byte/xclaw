@@ -77,6 +77,12 @@ Git 使用 argv 而不是拼接 shell 字符串；所有操作在容器内运行
 容器配置限制 CPU、内存和 PID，禁网、移除 capabilities 并开启 no-new-privileges。
 Docker 不可用时返回执行错误，不降级到宿主机。
 
+Ubuntu 服务可以通过 Docker 的 rootless 用户服务执行命令。XClaw 的 systemd 服务通过
+`DOCKER_HOST=unix:///run/user/<服务用户的 UID>/docker.sock` 连接本机 socket；
+用 `loginctl enable-linger` 让对应用户的 Docker 服务随系统启动。
+私有工作区在 rootless 容器里用映射到服务账号的 UID，生成的文件仍归服务账号所有。
+参见 [Docker rootless 安装说明](https://docs.docker.com/engine/security/rootless/)。
+
 输出边读取边限制缓冲区，超出部分持续排空。上限分别作用于 stdout 和 stderr，单位为 UTF-8
 字节，截断处可能出现替换字符。模型收到输出被截断的标记。
 `SandboxResult` 包含 `exit_code / stdout / stderr / timed_out / truncated`。
@@ -113,5 +119,7 @@ docker build -f Dockerfile.sandbox -t xclaw-sandbox:latest .
 $env:XCLAW_DOCKER_TESTS = "1"
 python -m pytest tests/test_docker_backend.py -q
 ```
+
+可以用 `--build-arg PYTHON_IMAGE=<镜像地址或 digest>` 指定 Python 3.11 的兼容基础镜像。
 
 未安装 Docker 时，真实容器测试会跳过，不能将模拟测试通过视为真实容器验证通过。

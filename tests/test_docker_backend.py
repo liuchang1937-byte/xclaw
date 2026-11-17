@@ -22,10 +22,13 @@ class SimulatedDocker(DockerSandbox):
         self.block = False
         self.executing = asyncio.Event()
         self.rm_fails = False
+        self.security_options = []
 
     async def _cli(self, args, **kwargs):
         self.commands.append(args)
         await asyncio.sleep(0)
+        if args[0] == "info":
+            return SandboxResult(stdout=json.dumps(self.security_options))
         if args[0] == "run":
             return SandboxResult(stdout="owned-container")
         if args[0] == "inspect":
@@ -76,11 +79,25 @@ async def test_private_command_mounts_only_its_workspace_and_clears_the_lease(tm
     docker = SimulatedDocker(workspace)
     docker.workspace_lease = lease
     assert (await docker.run_command("pwd")).ok
-    run, command, removed = docker.commands
+    run, command, removed = (args for args in docker.commands if args[0] != "info")
     mounts = [run[i + 1] for i, arg in enumerate(run) if arg == "-v"]
     assert mounts == [f"{workspace}:/workspace"]
     assert command[0] == "exec" and removed == ["rm", "-f", "owned-container"]
     assert not lease.exists()
+
+
+@pytest.mark.parametrize("rootless, user", [(True, "0:0"), (False, "1000:1001")])
+async def test_private_workspace_matches_daemon_user_namespace(
+    tmp_path, monkeypatch, rootless, user,
+):
+    monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(os, "getgid", lambda: 1001, raising=False)
+    docker = SimulatedDocker(tmp_path)
+    docker.workspace_lease = tmp_path / "docker.json"
+    docker.security_options = ["name=rootless"] if rootless else ["name=seccomp,profile=builtin"]
+    assert (await docker.run_command("id")).ok
+    launch = next(args for args in docker.commands if args[0] == "run")
+    assert launch[launch.index("--user") + 1] == user
 
 
 async def test_private_workspace_recovers_only_the_recorded_container(tmp_path, monkeypatch):
@@ -242,5 +259,31 @@ async def test_real_container_timeout_removes_running_job(tmp_path):
         assert result.timed_out
         assert not docker._container_id
         assert not (tmp_path / "marker").exists()
+    finally:
+        await docker.stop()
+
+
+@pytest.mark.skipif(os.getenv("XCLAW_DOCKER_TESTS") != "1", reason="需要 Docker 和已构建沙箱镜像")
+async def test_real_private_container_creates_files_owned_by_the_host_user(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    private = tmp_path / "private.txt"
+    private.write_text("sibling data")
+    lease = tmp_path / "lease.json"
+    docker = DockerSandbox(workspace=str(workspace), workspace_lease=lease)
+    try:
+        result = await docker.run_process(RunProcess(
+            argv=("python", "-c",
+                  "from pathlib import Path; "
+                  "assert not Path('/private.txt').exists(); "
+                  "Path('owned.txt').write_text('written in container')"),
+        ))
+        assert result.ok, result.stderr
+        artifact = workspace / "owned.txt"
+        assert artifact.read_text() == "written in container"
+        if hasattr(os, "getuid"):
+            assert artifact.stat().st_uid == os.getuid()
+        assert private.read_text() == "sibling data"
+        assert not lease.exists()
     finally:
         await docker.stop()

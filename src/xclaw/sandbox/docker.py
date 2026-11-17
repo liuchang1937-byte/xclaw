@@ -62,6 +62,19 @@ class DockerSandbox(Sandbox):
     async def _cli(self, args: list[str], *, timeout=30, output_limit=8000) -> SandboxResult:
         return await capture_process(["docker", *args], timeout=timeout, output_limit=output_limit)
 
+    async def _workspace_user(self) -> str | None:
+        if not hasattr(os, "getuid"):
+            return None
+        result = await self._cli(
+            ["info", "--format", "{{json .SecurityOptions}}"], timeout=10,
+        )
+        if not result.ok:
+            raise RuntimeError(f"无法读取 Docker 守护进程状态: {result.stderr}")
+        if "name=rootless" in (json.loads(result.stdout) or []):
+            # UID/GID 0 in a rootless container maps to the host account owning the files.
+            return "0:0"
+        return f"{os.getuid()}:{os.getgid()}"
+
     @classmethod
     async def recover_workspace(cls, lease: Path) -> bool:
         """Clean up a private workspace left mounted after a process interruption."""
@@ -172,8 +185,9 @@ class DockerSandbox(Sandbox):
                     )
                 args[1:1] = mounts
             if self.workspace_lease:
-                if hasattr(os, "getuid"):
-                    args[1:1] = ["--user", f"{os.getuid()}:{os.getgid()}", "--env", "HOME=/tmp"]
+                args[1:1] = ["--env", "HOME=/tmp"]
+                if user := await self._workspace_user():
+                    args[1:1] = ["--user", user]
                 atomic_json(self.workspace_lease, {
                     "name": self.container_name, "owner": self._owner,
                 })
