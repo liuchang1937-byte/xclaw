@@ -23,6 +23,7 @@ import json
 import re
 import signal
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -31,7 +32,7 @@ from loguru import logger
 from xclaw.ai.provider import OpenAIProvider, ProviderRegistry
 from xclaw.coding import CodingAgent
 from xclaw.core.concurrency import run_blocking
-from xclaw.core.execution import Capability
+from xclaw.core.execution import Capability, ExecutionMode
 from xclaw.core.scheduling import tool_failed
 from xclaw.core.workspace import TaskWorkspace
 from xclaw.im import FeishuAdapter, IMAdapter, QQAdapter, QQBridgeAdapter, WeixinAdapter
@@ -48,6 +49,7 @@ from xclaw.mcp import MCPClientManager
 from xclaw.mom.bus import EventBus
 from xclaw.persistence import exclusive_file_lock
 from xclaw.sandbox.docker import DockerSandbox
+from xclaw.sandbox.policy import ExecutionPolicy
 from xclaw.server.config import Config, load_config
 from xclaw.server.schedule_chat import (
     SCHEDULE_HELP,
@@ -58,6 +60,16 @@ from xclaw.server.schedule_chat import (
 )
 from xclaw.server.schedule_config import ScheduledJob
 from xclaw.server.scheduler import Scheduler
+from xclaw.server.subtasks import (
+    TASK_HELP,
+    WORKER_PROMPT,
+    StepSpec,
+    SubtaskRunner,
+    SubtaskStore,
+    delivery_paths,
+    new_task,
+    plan_task,
+)
 
 
 def _restore_checkpoint_deliveries(snapshot, agent, files):
@@ -228,6 +240,8 @@ class XClawServer:
     def _build_agent(
         self, workspace_dir: str | None = None, *, scheduled_job: ScheduledJob | None = None,
         schedule_dialog: bool = False, workspace_lease: Path | None = None,
+        execution_policy: ExecutionPolicy | None = None,
+        subtask: StepSpec | None = None,
     ) -> CodingAgent:
         """创建一个新的 CodingAgent（供默认 Agent 和多会话复用）"""
         agent_config = self.config.agent
@@ -257,7 +271,14 @@ class XClawServer:
             skills = Path(agent_config.skills_dir).expanduser().resolve()
             if Path.cwd().resolve().is_relative_to(skills):
                 raise ValueError("用户 Agent 的 Skill 目录不能包含服务目录")
-        policy = agent_config.build_execution_policy()
+        policy = execution_policy or agent_config.build_execution_policy()
+        if subtask and subtask.mode == "read":
+            policy = replace(policy, mode=ExecutionMode.VIEW)
+        system_prompt = agent_config.system_prompt
+        if schedule_dialog:
+            system_prompt = SCHEDULE_PROMPT
+        elif subtask:
+            system_prompt = f"{system_prompt}\n{WORKER_PROMPT}".strip()
         sandbox = (
             DockerSandbox(
                 workspace=workspace_dir, image=agent_config.docker_image,
@@ -273,8 +294,11 @@ class XClawServer:
             max_tokens=agent_config.max_tokens,
             max_tool_rounds=agent_config.max_tool_rounds,
             tool_scheduling=agent_config.tool_scheduling,
-            system_prompt=SCHEDULE_PROMPT if schedule_dialog else agent_config.system_prompt,
-            auto_memory=agent_config.auto_memory and scheduled_job is None and not schedule_dialog,
+            system_prompt=system_prompt,
+            auto_memory=(
+                agent_config.auto_memory and scheduled_job is None and not schedule_dialog
+                and subtask is None
+            ),
             enable_context_compression=agent_config.enable_context_compression,
             context_window=provider_config.context_window,
             compression_trigger_ratio=agent_config.compression_trigger_ratio,
@@ -294,8 +318,13 @@ class XClawServer:
         if with_tools:
             if not workspace_lease:
                 self.mcp.attach_tools(agent.tool_registry)
-            if scheduled_job is None and self.im_adapter and self.im_adapter.supports_files:
+            if (
+                scheduled_job is None and subtask is None
+                and self.im_adapter and self.im_adapter.supports_files
+            ):
                 register_delivery_tool(agent.tool_registry)
+        if subtask and subtask.mode == "read":
+            agent.tool_registry.restrict_to(frozenset({Capability.FILE_READ, Capability.PROMPT}))
         return agent
 
     async def _send_scheduled_chat(self, chat_id: str, content: str) -> bool:
@@ -437,6 +466,15 @@ class XClawServer:
             message.chat_type not in ("private", "p2p") and not message.chat_id
         ):
             return "无法确认发送者身份，本次任务未执行。"
+        parts = message.content.strip().split()
+        if parts[:2] == ["/task", "status"]:
+            if len(parts) > 3:
+                return "用法：/task status [任务编号]"
+            try:
+                owner = self._workspace_scope(self._session_id(message))
+                return SubtaskStore(owner / "subtasks").status(parts[2] if len(parts) == 3 else "")
+            except ValueError as exc:
+                return str(exc)
         # 同一工作区串行执行，避免重入 Agent 或修改另一轮正在交付的文件。
         sid = self._session_id(message)
         lock = self._session_locks.setdefault(sid, asyncio.Lock())
@@ -466,6 +504,7 @@ class XClawServer:
 
         if (
             getattr(self, "_supports_chat_schedules", False) and message.platform == "feishu"
+            and message.content.strip().split(maxsplit=1)[0] != "/task"
             and not getattr(message, "attachments", None) and is_schedule_request(message)
         ):
             return await self._handle_schedule_request(message)
@@ -493,6 +532,9 @@ class XClawServer:
         # 按会话隔离：拿到当前会话对应的 Agent
         agent = self._get_or_create_agent(message, owner_scope)
         session_file = self._session_file(self._session_id(message))
+
+        if message.content.strip().split(maxsplit=1)[0] == "/task":
+            return await self._run_subtasks(message, owner_scope, agent)
 
         # 处理特殊命令
         if message.content.strip() == "/reset":
@@ -635,13 +677,112 @@ class XClawServer:
             if isolated_agent:
                 await isolated_agent.sandbox_router.stop()
 
-    async def _prepare_file_inputs(self, agent: CodingAgent, message) -> str:
+    async def _run_subtasks(
+        self, message: IMMessage, owner_scope: Path, session_agent: CodingAgent,
+    ) -> str | IMReply:
+        parts = message.content.strip().split(maxsplit=1)
+        if len(parts) == 1:
+            return TASK_HELP
+        goal = parts[1]
+        arguments = goal.split()
+        action = arguments[0]
+        workspace = Path(session_agent.workspace_dir).resolve()
+        copy = None
+        store = SubtaskStore(owner_scope / "subtasks")
+        supports_files = bool(self.im_adapter and self.im_adapter.supports_files)
+        try:
+            if action in ("resume", "retry"):
+                if len(arguments) != (3 if action == "retry" else 2):
+                    return TASK_HELP
+                task = store.load(arguments[1])
+                if task.completed:
+                    return task.describe()
+                if task.task_directory:
+                    copy = TaskWorkspace(task.task_directory)
+                    if copy.source != workspace:
+                        raise ValueError("任务副本不属于当前工作区")
+            else:
+                event_id = message.message_id
+                if not event_id:
+                    raise ValueError("缺少消息编号，无法记录子任务")
+                task_id = hashlib.sha256(event_id.encode()).hexdigest()[:16]
+                if (store.folder(task_id) / "task.json").exists():
+                    return store.load(task_id).describe()
+                config = self.config.agent
+                if config.isolate_workspace:
+                    copy = await run_blocking(
+                        TaskWorkspace.create, workspace, config.task_workspace_dir,
+                        excluded=tuple(config.denied_paths),
+                    )
+                request = await self._prepare_file_inputs(
+                    session_agent, replace(message, content=goal),
+                    workspace=copy.work if copy else None,
+                )
+                specs = await plan_task(
+                    session_agent.client, request, session_agent.execution_policy.capabilities,
+                )
+                task = new_task(
+                    task_id, request, specs,
+                    task_directory=str(copy.directory) if copy else None,
+                    needs_excel=supports_files and message.platform == "feishu"
+                    and Capability.FILE_WRITE in session_agent.execution_policy.capabilities
+                    and requires_excel_file(goal),
+                )
+                store.save(task)
+            active = copy.work if copy else workspace
+            lease = owner_scope / "docker.json"
+
+            def build_worker(spec: StepSpec) -> CodingAgent:
+                worker = self._build_agent(
+                    str(active), workspace_lease=lease, subtask=spec,
+                    execution_policy=session_agent.execution_policy,
+                )
+                worker.run_metadata = {
+                    "session_id": self._session_id(message),
+                    "source_workspace": str(workspace),
+                    "task_id": task.id,
+                    "subtask_id": spec.id,
+                }
+                return worker
+
+            runner = SubtaskRunner(
+                store, task, build_worker, supports_files=supports_files,
+                parallel_readers=min(2, self.config.agent.tool_scheduling.max_parallel),
+            )
+            if action == "retry":
+                runner.retry(arguments[2])
+            await runner.run()
+            reply = task.describe()
+            if not task.completed:
+                return reply
+            if lease.exists():
+                raise ValueError("工作区容器尚未清理，暂时无法交付文件")
+            if copy:
+                patch = await run_blocking(copy.export_diff)
+                reply += f"\n任务副本：{copy.directory}\n变更记录：{patch}"
+            result = task.steps[-1].result
+            if supports_files and result and result.files:
+                files = delivery_paths(
+                    result, active, session_agent.execution_policy, task.needs_excel,
+                )
+                return await run_blocking(stage_reply_files, reply, files)
+            return reply
+        except ValueError as exc:
+            logger.warning("子任务请求未完成: {}", type(exc).__name__)
+            return f"子任务请求未完成：{str(exc)[:280]}"
+        except Exception as exc:
+            logger.warning("子任务调度异常: {}", type(exc).__name__)
+            return "子任务请求中断。可用 /task status 查看已保存的进度。"
+
+    async def _prepare_file_inputs(
+        self, agent: CodingAgent, message: IMMessage, *, workspace: Path | None = None,
+    ) -> str:
         attachments = getattr(message, "attachments", [])
         if not attachments or message.platform != "feishu":
             return message.content
         if self.im_adapter is None or not hasattr(self.im_adapter, "download_file"):
             raise ValueError("当前平台没有配置附件下载能力")
-        workspace = Path(agent.workspace_dir).resolve()
+        workspace = (workspace or Path(agent.workspace_dir)).resolve()
         descriptions = []
         for attachment in attachments:
             key = attachment.get("file_key")

@@ -35,6 +35,9 @@ IM 私聊按平台和发送者分配持久工作区。群聊中文件按发送�
 超长工具结果会标记截断；仍然超限则明确报错。配置与保留策略见
 [上下文管理说明](docs/CONTEXT_MANAGEMENT.md)。
 
+复杂聊天任务可以用 `/task <目标>` 启动，各子 Agent 使用独立上下文，支持依赖调度、
+验收与续跑。使用方式见 [子 Agent 任务](docs/SUBTASKS.md)。
+
 支持接入本地 stdio 和远程 Streamable HTTP MCP 工具服务，配置与示例见
 [MCP 接入说明](docs/MCP.md)。
 

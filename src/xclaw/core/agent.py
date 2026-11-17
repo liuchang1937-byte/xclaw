@@ -170,6 +170,7 @@ class Agent(ABC):
         completion_validator: Callable[[str], str | None] | None = None,
         resume_from: str | None = None,
         resolutions: dict[str, str] | None = None,
+        new_checkpoint: str | None = None,
     ) -> str:
         if self._run_active:
             raise RuntimeError("同一 Agent 不能并发执行任务")
@@ -183,10 +184,12 @@ class Agent(ABC):
                 self._journal = None
                 self.last_checkpoint_id = None
                 self._resuming = resume_from is not None
-                if resume_from and not self.checkpoint_store:
+                if resume_from and new_checkpoint:
+                    raise ValueError("不能同时新建和恢复 checkpoint")
+                if (resume_from or new_checkpoint) and not self.checkpoint_store:
                     raise ValueError("恢复任务需要配置 checkpoint_dir")
                 if self.checkpoint_store:
-                    checkpoint_id = resume_from or new_run_id()
+                    checkpoint_id = resume_from or new_checkpoint or new_run_id()
                     stack.enter_context(self.checkpoint_store.lease(checkpoint_id))
                     if resume_from:
                         state = self.checkpoint_store.load(resume_from)
@@ -202,6 +205,8 @@ class Agent(ABC):
                             self.client.compressor.summary = state.summary
                         user_input, tools = state.user_input, state.tools
                     else:
+                        if new_checkpoint and self.checkpoint_store.path(new_checkpoint).exists():
+                            raise ValueError("checkpoint 已存在，请使用恢复入口")
                         state = RunSnapshot(
                             run_id=checkpoint_id,
                             workspace=self._checkpoint_workspace(),

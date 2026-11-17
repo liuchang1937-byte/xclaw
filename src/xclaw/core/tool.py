@@ -295,6 +295,13 @@ class ToolRegistry:
         self._tools[tool.name] = tool
         logger.info(f"添加工具: {tool.name}")
 
+    def restrict_to(self, capabilities: frozenset[Capability]) -> None:
+        """Remove tools outside a worker's allowed capabilities from the registry."""
+        self._tools = {
+            name: tool for name, tool in self._tools.items()
+            if tool.capabilities is not None and tool.capabilities <= capabilities
+        }
+
     def get(self, name: str) -> Tool | None:
         """获取指定名称的工具"""
         return self._tools.get(name)
