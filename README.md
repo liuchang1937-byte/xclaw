@@ -24,6 +24,9 @@ QQ 可选 WebSocket 直连或 HTTP 桥接，个人微信通过 iLink ClawBot 扫
 默认 `execute`，独立文件删除工具默认关闭；Docker 仍共享指定工作区。
 完整配置、边界和验证方法见 [执行环境说明](docs/EXECUTION_ENVIRONMENTS.md)。
 
+IM 私聊按平台和发送者分配持久工作区。群聊中文件按发送者和群隔离。参见
+[聊天用户工作区](docs/EXECUTION_ENVIRONMENTS.md#聊天用户工作区)。
+
 已提供目录型 Word / Excel Skill，支持 `.docx` / `.xlsx` 的读取、创建、编辑、模板填充和数据合并。
 本地安装 `uv sync --extra office --group dev`，Agent 执行需重建沙箱镜像并重启。
 目录、调用方法及限制见 [Word / Excel 技能说明](docs/WORD_EXCEL_SKILLS.md)。

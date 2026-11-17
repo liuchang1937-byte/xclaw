@@ -335,6 +335,7 @@ async def test_im_resume_reuses_isolated_workspace_and_is_scoped_to_session(tmp_
         default_provider="fake",
         agent={
             "workspace_dir": str(source),
+            "user_workspace_dir": str(tmp_path / "users"),
             "isolate_workspace": True,
             "task_workspace_dir": str(tmp_path / "tasks"),
             "checkpoint_dir": str(tmp_path / "checkpoints"),
@@ -362,8 +363,8 @@ async def test_im_resume_reuses_isolated_workspace_and_is_scoped_to_session(tmp_
     server._sessions_dir = tmp_path / "sessions"
     build = server._build_agent
 
-    def build_once(workspace_dir=None):
-        agent = build(workspace_dir)
+    def build_once(workspace_dir=None, **kwargs):
+        agent = build(workspace_dir, **kwargs)
         agent.client.MAX_RETRIES = 1
         return agent
 
@@ -372,6 +373,10 @@ async def test_im_resume_reuses_isolated_workspace_and_is_scoped_to_session(tmp_
     def message(text, sender="owner"):
         return IMMessage("feishu", "m1", "chat", "p2p", sender, content=text)
 
+    owner_id = server._session_id(message(""))
+    work = server._workspace_scope(owner_id) / "work"
+    work.mkdir()
+    (work / "a.py").write_text("old\n")
     failed = await server._handle_im_message(message("edit a.py"))
     assert "可恢复 checkpoint" in failed
     (state,) = CheckpointStore(tmp_path / "checkpoints").list()
@@ -388,5 +393,5 @@ async def test_im_resume_reuses_isolated_workspace_and_is_scoped_to_session(tmp_
     assert len(list((tmp_path / "tasks").iterdir())) == 1
     assert (source / "a.py").read_text() == "old\n"
     assert (Path(state.workspace) / "a.py").read_text() == "new\n"
-    assert len(server._sessions["private-owner"].client.get_history()) == 2
-    await server._sessions["private-owner"].sandbox_router.stop()
+    assert len(server._sessions[owner_id].client.get_history()) == 2
+    await server._sessions[owner_id].sandbox_router.stop()

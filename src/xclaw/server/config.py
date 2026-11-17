@@ -88,6 +88,7 @@ class AgentConfig(BaseModel):
     compression_keep_recent: int = Field(default=6, ge=1)
     docker_image: str = "xclaw-sandbox:latest"
     workspace_dir: str = "."
+    user_workspace_dir: Path = Field(default_factory=lambda: Path.home() / ".xclaw" / "workspaces")
     skills_dir: str | None = None
     execution_mode: ExecutionMode = ExecutionMode.EXECUTE
     allow_file_delete: bool = False

@@ -40,11 +40,14 @@ from xclaw.im.delivery import (
     collect_deliveries,
     register_delivery_tool,
     requires_excel_file,
+    stage_reply_files,
     validate_file,
 )
 from xclaw.im.weixin import login_weixin
 from xclaw.mcp import MCPClientManager
 from xclaw.mom.bus import EventBus
+from xclaw.persistence import exclusive_file_lock
+from xclaw.sandbox.docker import DockerSandbox
 from xclaw.server.config import Config, load_config
 from xclaw.server.schedule_chat import (
     SCHEDULE_HELP,
@@ -224,7 +227,7 @@ class XClawServer:
 
     def _build_agent(
         self, workspace_dir: str | None = None, *, scheduled_job: ScheduledJob | None = None,
-        schedule_dialog: bool = False,
+        schedule_dialog: bool = False, workspace_lease: Path | None = None,
     ) -> CodingAgent:
         """创建一个新的 CodingAgent（供默认 Agent 和多会话复用）"""
         agent_config = self.config.agent
@@ -249,6 +252,20 @@ class XClawServer:
             self.config.providers[0],
         )
 
+        workspace_dir = workspace_dir or agent_config.workspace_dir
+        if workspace_lease and agent_config.skills_dir:
+            skills = Path(agent_config.skills_dir).expanduser().resolve()
+            if Path.cwd().resolve().is_relative_to(skills):
+                raise ValueError("用户 Agent 的 Skill 目录不能包含服务目录")
+        policy = agent_config.build_execution_policy()
+        sandbox = (
+            DockerSandbox(
+                workspace=workspace_dir, image=agent_config.docker_image,
+                read_only=Capability.PROCESS not in policy.capabilities,
+                workspace_lease=workspace_lease,
+            )
+            if workspace_lease else None
+        )
         agent = CodingAgent(
             provider=provider,
             model=provider_config.model,
@@ -264,17 +281,19 @@ class XClawServer:
             compression_safety_margin=agent_config.compression_safety_margin,
             compression_keep_recent=agent_config.compression_keep_recent,
             docker_image=agent_config.docker_image,
-            workspace_dir=workspace_dir or agent_config.workspace_dir,
+            workspace_dir=workspace_dir,
             trace_dir=None if schedule_dialog else agent_config.trace_dir,
             checkpoint_dir=None if schedule_dialog else agent_config.checkpoint_dir,
             context_strategy=agent_config.context_strategy,
             skills_dir=agent_config.skills_dir,
-            execution_policy=agent_config.build_execution_policy(),
+            execution_policy=policy,
+            sandbox=sandbox,
             register_default_tools=with_tools,
             event_bus=self.event_bus,
         )
         if with_tools:
-            self.mcp.attach_tools(agent.tool_registry)
+            if not workspace_lease:
+                self.mcp.attach_tools(agent.tool_registry)
             if scheduled_job is None and self.im_adapter and self.im_adapter.supports_files:
                 register_delivery_tool(agent.tool_registry)
         return agent
@@ -363,14 +382,25 @@ class XClawServer:
 
     # ─── 会话隔离与历史恢复 ──────────────────────────
 
-    def _session_id(self, message) -> str:
-        """根据消息计算会话 ID：私聊按人、群聊按群"""
-        if message.platform in ("qq_bridge", "weixin"):
-            digest = hashlib.sha256(message.chat_id.encode("utf-8")).hexdigest()
-            return f"{message.platform}-{message.chat_type}-{digest}"
-        if message.chat_type in ("private", "p2p"):
-            return f"private-{message.sender_id}"
-        return f"group-{message.chat_id}"
+    def _session_id(self, message: IMMessage) -> str:
+        """Private workspaces follow the sender; group workspaces also include the chat."""
+        is_private = message.chat_type in ("private", "p2p")
+        identity = [message.platform, message.sender_id, None if is_private else message.chat_id]
+        digest = hashlib.sha256(json.dumps(identity).encode("utf-8")).hexdigest()
+        return f"im-{digest}"
+
+    def _workspace_scope(self, session_id: str) -> Path:
+        config = self.config.agent
+        root = config.user_workspace_dir.expanduser().resolve()
+        shared = Path(config.workspace_dir).expanduser().resolve()
+        if root.is_relative_to(shared) or shared.is_relative_to(root):
+            raise ValueError("用户工作区根目录必须与服务的共享工作区分开")
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        scope = root / session_id
+        scope.mkdir(exist_ok=True, mode=0o700)
+        if scope.resolve() != scope:
+            raise ValueError("用户工作区目录不能是链接")
+        return scope
 
     def _session_file(self, session_id: str) -> Path:
         """会话历史的 JSON 文件路径"""
@@ -380,11 +410,11 @@ class XClawServer:
         """会话 KV 长期记忆的 JSON 文件路径。"""
         return self._sessions_dir / f"{session_id}.memory.json"
 
-    def _get_or_create_agent(self, message) -> CodingAgent:
+    def _get_or_create_agent(self, message: IMMessage, scope: Path) -> CodingAgent:
         """获取当前会话对应的 Agent（不存在则创建，并加载历史）"""
         sid = self._session_id(message)
         if sid not in self._sessions:
-            agent = self._build_agent()
+            agent = self._build_agent(str(scope / "work"), workspace_lease=scope / "docker.json")
             # 加载已完成的对话；进行中任务通过 checkpoint 单独恢复。
             f = self._session_file(sid)
             if f.exists():
@@ -402,14 +432,18 @@ class XClawServer:
             logger.info(f"新建会话: {sid} (历史 {len(agent.client.get_history())} 条)")
         return self._sessions[sid]
 
-    async def _handle_im_message(self, message) -> str | IMReply | None:
-        # 同一会话的任务串行执行，避免重入 Agent 或交付另一轮任务的文件。
+    async def _handle_im_message(self, message: IMMessage) -> str | IMReply | None:
+        if not message.sender_id or (
+            message.chat_type not in ("private", "p2p") and not message.chat_id
+        ):
+            return "无法确认发送者身份，本次任务未执行。"
+        # 同一工作区串行执行，避免重入 Agent 或修改另一轮正在交付的文件。
         sid = self._session_id(message)
         lock = self._session_locks.setdefault(sid, asyncio.Lock())
         async with lock:
             return await self._run_im_message(message)
 
-    async def _run_im_message(self, message) -> str | IMReply | None:
+    async def _run_im_message(self, message: IMMessage) -> str | IMReply | None:
         """处理来自 IM 的消息
 
         将 IM 消息转发给 Agent 处理，并返回结果。
@@ -436,8 +470,28 @@ class XClawServer:
         ):
             return await self._handle_schedule_request(message)
 
+        sid = self._session_id(message)
+        try:
+            owner_scope = self._workspace_scope(sid)
+            with exclusive_file_lock(owner_scope / "turn.lock", "工作区正在处理另一条消息"):
+                lease = owner_scope / "docker.json"
+                if await DockerSandbox.recover_workspace(lease):
+                    previous = self._sessions.pop(sid, None)
+                    if previous is not None:
+                        await previous.sandbox_router.stop()
+                work = owner_scope / "work"
+                work.mkdir(exist_ok=True, mode=0o700)
+                if work.resolve() != work:
+                    raise ValueError("用户文件目录不能是链接")
+                return await self._run_workspace_message(message, owner_scope)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("无法打开会话工作区 {}: {}", sid, exc)
+            return "当前会话的工作区暂时不可用，请稍后重试。"
+
+    async def _run_workspace_message(self, message: IMMessage, owner_scope: Path) -> str | IMReply:
+        lease = owner_scope / "docker.json"
         # 按会话隔离：拿到当前会话对应的 Agent
-        agent = self._get_or_create_agent(message)
+        agent = self._get_or_create_agent(message, owner_scope)
         session_file = self._session_file(self._session_id(message))
 
         # 处理特殊命令
@@ -488,6 +542,7 @@ class XClawServer:
                 task_workspace = TaskWorkspace(snapshot.metadata["task_directory"])
                 if (
                     str(task_workspace.work) != snapshot.workspace
+                    or task_workspace.source != Path(scope["source_workspace"])
                     or not task_workspace.work.is_dir()
                 ):
                     raise ValueError("checkpoint 对应的任务副本已不存在或不匹配")
@@ -499,7 +554,9 @@ class XClawServer:
                     excluded=tuple(self.config.agent.denied_paths),
                 )
             if task_workspace:
-                isolated_agent = self._build_agent(str(task_workspace.work))
+                isolated_agent = self._build_agent(
+                    str(task_workspace.work), workspace_lease=lease,
+                )
                 isolated_agent.memory_scope = session_agent.memory_scope
                 isolated_agent.client.set_history(agent.client.get_history())
                 for item in agent.conversation_memory.get_all():
@@ -538,6 +595,8 @@ class XClawServer:
                     completion_validator=check_completion if needs_excel else None,
                     resume_from=resume_id,
                 )
+                if lease.exists():
+                    raise RuntimeError("工作区容器尚未清理，暂时无法交付本轮文件")
                 # 在交付前再次确认工作区边界和权限，防止排队后文件目标变化。
                 workspace = Path(agent.workspace_dir).resolve()
                 for path in files:
@@ -553,7 +612,7 @@ class XClawServer:
                 )
             # 已完成会话历史；轮次状态由 Agent 的 checkpoint 独立保存。
             agent.client.save_history(str(session_file))
-            return IMReply(text=reply, files=list(files)) if files else reply
+            return await run_blocking(stage_reply_files, reply, files) if files else reply
         except Exception as e:
             logger.error(f"Agent 处理消息失败: {e}")
             checkpoint = (
@@ -616,9 +675,8 @@ class XClawServer:
         logger.info("=" * 50)
 
         await self.mcp.start()
-        for agent in [self.agent, *self._sessions.values()]:
-            if agent is not None:
-                self.mcp.attach_tools(agent.tool_registry)
+        if self.agent is not None:
+            self.mcp.attach_tools(self.agent.tool_registry)
 
         # 启动 IM 适配器
         if self.im_adapter:

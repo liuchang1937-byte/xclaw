@@ -1,6 +1,7 @@
 """Docker 生命周期与进程协议测试；默认不依赖 Docker daemon。"""
 
 import asyncio
+import json
 import os
 import sys
 
@@ -66,6 +67,41 @@ async def test_native_argv_and_read_only_mount(tmp_path):
     assert command[-2:] == ["echo", "literal; $(whoami)"]
     assert "sh" not in command
     await docker.stop()
+
+
+async def test_private_command_mounts_only_its_workspace_and_clears_the_lease(tmp_path):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    lease = tmp_path / "docker.json"
+    docker = SimulatedDocker(workspace)
+    docker.workspace_lease = lease
+    assert (await docker.run_command("pwd")).ok
+    run, command, removed = docker.commands
+    mounts = [run[i + 1] for i, arg in enumerate(run) if arg == "-v"]
+    assert mounts == [f"{workspace}:/workspace"]
+    assert command[0] == "exec" and removed == ["rm", "-f", "owned-container"]
+    assert not lease.exists()
+
+
+async def test_private_workspace_recovers_only_the_recorded_container(tmp_path, monkeypatch):
+    lease = tmp_path / "docker.json"
+    name = "xclaw-sandbox-83-1234abcd"
+    owner = "a" * 32
+    lease.write_text(json.dumps({"name": name, "owner": owner}))
+    verified = False
+    commands = []
+
+    async def cli(_docker, args):
+        commands.append(args)
+        return SandboxResult(stdout=owner if verified else "another-owner")
+
+    monkeypatch.setattr(DockerSandbox, "_cli", cli)
+    with pytest.raises(RuntimeError, match="无法确认容器归属"):
+        await DockerSandbox.recover_workspace(lease)
+    assert lease.exists() and len(commands) == 1
+    verified = True
+    assert await DockerSandbox.recover_workspace(lease)
+    assert commands[-1] == ["rm", "-f", name] and not lease.exists()
 
 
 async def test_skill_directory_has_read_only_alias_and_workspace_mask(tmp_path):

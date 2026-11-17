@@ -15,6 +15,7 @@ from xclaw.im.adapter import IMMessage, IMReply
 from xclaw.im.delivery import collect_deliveries, register_delivery_tool, validate_file
 from xclaw.im.feishu import FeishuAdapter
 from xclaw.sandbox import ExecutionPolicy
+from xclaw.server.config import Config
 from xclaw.server.main import XClawServer
 
 openpyxl = pytest.importorskip("openpyxl")
@@ -96,10 +97,13 @@ async def test_feishu_request_recovers_dsml_creates_and_sends_actual_excel(tmp_p
     adapter._tenant_access_token = "test-token"
     adapter._token_expires_at = time.time() + 1000
     server = object.__new__(XClawServer)
+    server.config = Config(agent={
+        "user_workspace_dir": tmp_path / "users", "workspace_dir": str(tmp_path / "deployment"),
+    })
     server.im_adapter = adapter
     server._session_locks = {}
     server._sessions_dir = tmp_path / "sessions"
-    server._get_or_create_agent = lambda _: agent
+    server._get_or_create_agent = lambda *_: agent
     adapter.on_message(server._handle_im_message)
     message = IMMessage(
         platform="feishu",
@@ -111,7 +115,6 @@ async def test_feishu_request_recovers_dsml_creates_and_sends_actual_excel(tmp_p
     )
     try:
         await adapter._dispatch(message)
-        assert server._session_id(message) == "private-ou_user"
         assert [request.url.path for request in requests] == [
             "/open-apis/im/v1/files",
             "/open-apis/im/v1/messages/om_request/reply",

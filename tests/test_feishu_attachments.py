@@ -16,6 +16,7 @@ from xclaw.coding import CodingAgent
 from xclaw.coding.excel_tool import register_excel_tool
 from xclaw.im.adapter import IMMessage
 from xclaw.im.feishu import FeishuAdapter
+from xclaw.server.config import Config
 from xclaw.server.main import XClawServer
 
 
@@ -116,10 +117,13 @@ async def test_received_excel_downloads_from_original_message_and_is_read_by_age
     agent = CodingAgent(provider, workspace_dir=str(tmp_path), register_default_tools=False)
     register_excel_tool(agent.tool_registry)
     server = object.__new__(XClawServer)
+    server.config = Config(agent={
+        "user_workspace_dir": tmp_path / "users", "workspace_dir": str(tmp_path / "deployment"),
+    })
     server.im_adapter = adapter
     server._session_locks = {}
     server._sessions_dir = tmp_path / "sessions"
-    server._get_or_create_agent = lambda _: agent
+    server._get_or_create_agent = lambda *_: agent
     adapter.on_message(server._handle_im_message)
     message = IMMessage(
         "feishu",
@@ -165,10 +169,13 @@ async def test_download_failure_does_not_create_file_or_ask_llm_to_guess(tmp_pat
     provider = ScriptedProvider([])
     agent = CodingAgent(provider, workspace_dir=str(tmp_path), register_default_tools=False)
     server = object.__new__(XClawServer)
+    server.config = Config(agent={
+        "user_workspace_dir": tmp_path / "users", "workspace_dir": str(tmp_path / "deployment"),
+    })
     server.im_adapter = adapter
     server._session_locks = {}
     server._sessions_dir = tmp_path / "sessions"
-    server._get_or_create_agent = lambda _: agent
+    server._get_or_create_agent = lambda *_: agent
     adapter.on_message(server._handle_im_message)
     target = tmp_path / "received.xlsx"
     try:

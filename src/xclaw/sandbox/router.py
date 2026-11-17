@@ -79,6 +79,9 @@ class SandboxRouter:
                 raise PermissionError("进程工具未提供请求构建器，拒绝在宿主机调用函数")
             self.last_route = self.host.name
             async with self._execution_gate.hold(shared=tool.supports_parallel):
+                lease = getattr(self.docker, "workspace_lease", None)
+                if lease and lease.exists():
+                    raise PermissionError("工作区容器尚未清理，暂时无法从宿主机访问文件")
                 return await self.host.execute(tool, prepared)
         except (ValueError, TypeError, PermissionError) as exc:
             return f"❌ {exc}"

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 from pathlib import Path
 from uuid import uuid4
 
 from loguru import logger
 
 from xclaw.core.execution import ProcessPlan, RunProcess
+from xclaw.persistence import atomic_json
 from xclaw.sandbox.base import Sandbox, SandboxResult
 from xclaw.sandbox.policy import ExecutionPolicy
 from xclaw.sandbox.process import capture_process
@@ -27,11 +30,13 @@ class DockerSandbox(Sandbox):
         workspace: str | None = None,
         container_name: str | None = None,
         read_only: bool = False,
+        workspace_lease: Path | None = None,
     ):
         super().__init__(workspace)
         self.image = image
         self.container_name = container_name or f"xclaw-sandbox-{os.getpid()}-{uuid4().hex[:8]}"
         self.read_only = read_only
+        self.workspace_lease = workspace_lease
         self._container_id = ""
         self._lifecycle_lock = asyncio.Lock()
         self._execution_lock = asyncio.Lock()
@@ -46,12 +51,47 @@ class DockerSandbox(Sandbox):
         root = root.resolve()
         if not root.is_dir() or root == Path(self.workspace):
             raise ValueError("Skill 根目录必须是独立的已有目录")
+        if self.workspace_lease:
+            users_root = self.workspace_lease.parent.parent
+            if users_root.is_relative_to(root) or root.is_relative_to(users_root):
+                raise ValueError("共享 Skill 目录必须和用户工作区分开")
         if self._container_id or self._closed:
             raise RuntimeError("必须在 Docker 后端启动前配置 Skill 目录")
         self.skills_root = root
 
     async def _cli(self, args: list[str], *, timeout=30, output_limit=8000) -> SandboxResult:
         return await capture_process(["docker", *args], timeout=timeout, output_limit=output_limit)
+
+    @classmethod
+    async def recover_workspace(cls, lease: Path) -> bool:
+        """Clean up a private workspace left mounted after a process interruption."""
+        try:
+            record = json.loads(lease.read_bytes())
+        except FileNotFoundError:
+            return False
+        name, owner = record["name"], record["owner"]
+        if not re.fullmatch(r"xclaw-sandbox-\d+-[0-9a-f]{8}", name) or not re.fullmatch(
+            r"[0-9a-f]{32}", owner,
+        ):
+            raise ValueError("无效的工作区容器记录")
+        docker = cls(container_name=name, workspace_lease=lease)
+        docker._owner = owner
+        docker._container_id = name
+        docker._starting = True
+        await docker.stop()
+        return True
+
+    def _clear_container(self) -> None:
+        if self.workspace_lease:
+            try:
+                record = json.loads(self.workspace_lease.read_bytes())
+            except FileNotFoundError:
+                record = {}
+            if record.get("name") == self.container_name and record.get("owner") == self._owner:
+                self.workspace_lease.unlink(missing_ok=True)
+        self._container_id = ""
+        self._unhealthy = False
+        self._starting = False
 
     async def _remove_container(self) -> None:
         """失败时保留容器标识并禁止复用，不声称已终止容器内进程。"""
@@ -67,8 +107,7 @@ class DockerSandbox(Sandbox):
                 ]
             )
             if not owner.ok and "No such" in owner.stderr:
-                self._container_id = ""
-                self._starting = False
+                self._clear_container()
                 return
             if not owner.ok or owner.stdout.strip() != self._owner:
                 self._unhealthy = True
@@ -77,9 +116,7 @@ class DockerSandbox(Sandbox):
         if not result.ok and "No such container" not in result.stderr:
             self._unhealthy = True
             raise RuntimeError(f"Docker 容器清理失败: {result.stderr}")
-        self._container_id = ""
-        self._unhealthy = False
-        self._starting = False
+        self._clear_container()
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
@@ -89,6 +126,8 @@ class DockerSandbox(Sandbox):
                 raise RuntimeError("Docker 后端清理未完成，拒绝继续执行")
             if self._container_id:
                 return
+            if self.workspace_lease and self.workspace_lease.exists():
+                raise RuntimeError("工作区上次的容器尚未清理")
             mount = f"{self.workspace}:{self.MOUNT_DIR}"
             if self.read_only:
                 mount += ":ro"
@@ -132,6 +171,12 @@ class DockerSandbox(Sandbox):
                         ["-v", f"{self.skills_root}:{self.MOUNT_DIR}/{relative.as_posix()}:ro"]
                     )
                 args[1:1] = mounts
+            if self.workspace_lease:
+                if hasattr(os, "getuid"):
+                    args[1:1] = ["--user", f"{os.getuid()}:{os.getgid()}", "--env", "HOME=/tmp"]
+                atomic_json(self.workspace_lease, {
+                    "name": self.container_name, "owner": self._owner,
+                })
             # 启动返回前取消也可以通过唯一名称清理本后端创建的容器。
             self._container_id = self.container_name
             self._starting = True
@@ -144,8 +189,7 @@ class DockerSandbox(Sandbox):
                 logger.info(f"Docker 后端启动: {self._container_id[:12]}")
             except FileNotFoundError:
                 # CLI 未能启动，没有分配容器，不需要发起删除命令。
-                self._container_id = ""
-                self._starting = False
+                self._clear_container()
                 raise
             except BaseException:
                 try:
@@ -198,6 +242,9 @@ class DockerSandbox(Sandbox):
                         result.stderr += f"\n命令超时（>{request.timeout}s），容器已销毁"
                     except Exception as exc:
                         result.stderr += f"\n命令超时，{exc}；无法确认容器内进程已停止"
+                elif self.workspace_lease:
+                    async with self._lifecycle_lock:
+                        await self._remove_container()
                 return result
             except asyncio.CancelledError:
                 try:
@@ -208,6 +255,12 @@ class DockerSandbox(Sandbox):
                     logger.error(f"取消执行后的容器清理失败: {exc}")
                 raise
             except Exception as exc:
+                if self.workspace_lease and self._container_id and not self._unhealthy:
+                    async with self._lifecycle_lock:
+                        try:
+                            await self._remove_container()
+                        except Exception as cleanup_error:
+                            logger.error(f"工作区容器清理失败: {cleanup_error}")
                 return SandboxResult(exit_code=-1, stderr=f"Docker 执行失败: {exc}")
             finally:
                 self._active_task = None

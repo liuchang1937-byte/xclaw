@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import re
+import shutil
 import zipfile
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from xclaw.core.execution import Capability
 from xclaw.core.tool import Tool, ToolRegistry
+from xclaw.im.adapter import IMReply
 
 MAX_FILE_BYTES = 30_000_000
 _pending: ContextVar[list[Path] | None] = ContextVar("xclaw_delivery", default=None)
@@ -40,6 +43,22 @@ def validate_file(path: Path) -> None:
                     raise ValueError("缺少工作簿或工作表")
         except (zipfile.BadZipFile, ValueError) as exc:
             raise ValueError("交付文件不是有效的 .xlsx 工作簿") from exc
+
+
+def stage_reply_files(text: str, files: list[Path]) -> IMReply:
+    """Copy finished files while their workspace is locked, before uploading them."""
+    staging = TemporaryDirectory(prefix="xclaw-delivery-")
+    paths = []
+    try:
+        for index, source in enumerate(files):
+            target = Path(staging.name) / str(index) / source.name
+            target.parent.mkdir()
+            shutil.copyfile(source, target)
+            paths.append(target)
+    except BaseException:
+        staging.cleanup()
+        raise
+    return IMReply(text=text, files=paths, staging=staging)
 
 
 def requires_excel_file(text: str) -> bool:

@@ -9,6 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Callable, Coroutine
 
 from loguru import logger
@@ -51,6 +52,7 @@ class IMReply:
 
     text: str = ""
     files: list[Path] = field(default_factory=list)
+    staging: TemporaryDirectory | None = field(default=None, repr=False, compare=False)
 
 
 # 消息处理回调类型
@@ -144,13 +146,17 @@ class IMAdapter(ABC):
                 reply = await handler(message)
                 if isinstance(reply, IMReply):
                     failed = []
-                    for path in reply.files:
-                        if not await self.send_file(
-                            message.chat_id, path, reply_to=message.message_id,
-                            chat_type=message.chat_type,
-                        ):
-                            detail = self.file_failure_reason()
-                            failed.append(f"{path.name}（{detail}）" if detail else path.name)
+                    try:
+                        for path in reply.files:
+                            if not await self.send_file(
+                                message.chat_id, path, reply_to=message.message_id,
+                                chat_type=message.chat_type,
+                            ):
+                                detail = self.file_failure_reason()
+                                failed.append(f"{path.name}（{detail}）" if detail else path.name)
+                    finally:
+                        if reply.staging:
+                            reply.staging.cleanup()
                     reply = (
                         f"文件已生成，但发送失败：{', '.join(failed)}。"
                         "请根据错误提示处理后重试。"
