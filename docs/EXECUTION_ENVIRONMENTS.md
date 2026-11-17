@@ -120,6 +120,7 @@ $env:XCLAW_DOCKER_TESTS = "1"
 python -m pytest tests/test_docker_backend.py -q
 ```
 
-可以用 `--build-arg PYTHON_IMAGE=<镜像地址或 digest>` 指定 Python 3.11 的兼容基础镜像。
+可以用 `--build-arg PYTHON_IMAGE=<镜像地址或 digest>` 指定 Debian 系的 Python 3.11 基础镜像。
+构建时也可用 `DEBIAN_MIRROR` 和 `PIP_INDEX_URL` 构建参数指定依赖镜像。
 
 未安装 Docker 时，真实容器测试会跳过，不能将模拟测试通过视为真实容器验证通过。

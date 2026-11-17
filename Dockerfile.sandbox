@@ -1,10 +1,17 @@
 ARG PYTHON_IMAGE=python:3.11-slim
 FROM ${PYTHON_IMAGE}
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash git \
+ARG DEBIAN_MIRROR
+ARG PIP_INDEX_URL
+
+RUN if [ -n "$DEBIAN_MIRROR" ]; then \
+        sed -i "s|http://deb.debian.org|${DEBIAN_MIRROR%/}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=25 -o Acquire::https::Timeout=25 update \
+    && apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=25 -o Acquire::https::Timeout=25 \
+        install -y --no-install-recommends bash git \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir pytest pytest-asyncio ruff \
+    && pip install --no-cache-dir --timeout 25 --retries 2 pytest pytest-asyncio ruff \
         'python-docx>=1.2.0,<2' 'openpyxl>=3.1.5,<4'
 
 WORKDIR /workspace
